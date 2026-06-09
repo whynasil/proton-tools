@@ -351,54 +351,117 @@ def snapshot(tab_id: str, userId: str = Query(default="")):
 
 @app.post("/tabs/{tab_id}/click")
 def click(tab_id: str, body: Dict[str, Any]):
-    """Click an element by ref. Body: {userId, ref}.
-    Uses Playwright native click for proper React event handling."""
+    """Click an element by ref or selector. Body: {userId, ref, selector?}.
+    Uses Playwright native click for proper React event handling.
+    Priority: selector > ref > text match."""
     user_id = body.get("userId", "default")
     ref = body.get("ref", "").lstrip("@e")
+    selector = body.get("selector", "")
 
     page = _get_page(user_id, tab_id)
-    try:
-        # Use Playwright's native click — triggers real DOM events (React compatible)
-        locator = page.locator(f"[data-hermes-ref='{ref}']")
-        if not locator.count():
-            return {"error": "element not found", "url": page.url}
-        locator.click(force=True)  # force=True bypasses visibility checks
-        return {"url": page.url, "ok": True}
-    except Exception as e:
-        # Fall back to JS click
+
+    def try_click(locator_str, name):
         try:
-            js_code = (
-                "(function(){"
-                "var el=document.querySelector('[data-hermes-ref=\"" + ref + "\"]');"
-                "if(!el)return JSON.stringify({ok:false,error:'not found'});"
-                "el.scrollIntoView({block:'center'});"
-                "el.click();"
-                "return JSON.stringify({ok:true,tag:el.tagName});"
-                "})()"
-            )
-            result = page.evaluate(js_code)
-            data = json.loads(result)
-            return {"url": page.url, "ok": data.get("ok", False), "fallback": "js"}
+            loc = page.locator(locator_str)
+            if loc.count():
+                loc.first.scroll_into_view_if_needed()
+                loc.first.click(force=False, timeout=5000)
+                return {"url": page.url, "ok": True, "method": name}
         except:
-            return {"error": str(e)[:200], "url": page.url}
+            pass
+        return None
+
+    # 1. Try explicit CSS selector
+    if selector:
+        result = try_click(selector, "selector")
+        if result:
+            return result
+
+    # 2. Try data-hermes-ref
+    if ref:
+        result = try_click(f"[data-hermes-ref='{ref}']", "ref")
+        if result:
+            return result
+        # Also try ref as selector (e.g. "#username")
+        result = try_click(ref if ref.startswith("#") or ref.startswith(".") else f"#{ref}", "ref-as-id")
+        if result:
+            return result
+
+    # 3. Try text match from selector
+    if selector:
+        try:
+            loc = page.get_by_text(selector, exact=False)
+            if loc.count():
+                loc.first.click(force=True)
+                return {"url": page.url, "ok": True, "method": "text"}
+        except:
+            pass
+
+    # 4. Last resort: JS click with broad search - use page.evaluateHandle for safety
+    try:
+        search = selector or ref or ""
+        # Build safe JS without embedding user strings in code
+        result = page.evaluate("""
+            (search) => {
+                let el = null;
+                if (search.startsWith('#')) el = document.querySelector(search);
+                else if (search.startsWith('.')) el = document.querySelector(search);
+                else if (search) {
+                    const btns = document.querySelectorAll('button');
+                    for (let i = 0; i < btns.length; i++) {
+                        if (btns[i].textContent.includes(search)) {
+                            el = btns[i];
+                            break;
+                        }
+                    }
+                }
+                if (!el) return JSON.stringify({ok: false, error: 'not found'});
+                el.scrollIntoView({block: 'center'});
+                el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+                return JSON.stringify({ok: true, tag: el.tagName});
+            }
+        """, search)
+        data = json.loads(result)
+        return {"url": page.url, "ok": data.get("ok", False), "fallback": "js"}
+    except Exception as e:
+        return {"error": str(e)[:200], "url": page.url}
 
 
 @app.post("/tabs/{tab_id}/type")
 def type_text(tab_id: str, body: Dict[str, Any]):
-    """Type text into an element by ref or by id/selector. Body: {userId, ref, text}.
-    Uses native JS setter to bypass React visibility/readonly issues."""
+    """Type text into element via JS native setter. Body: {userId, ref?, selector?, text}.
+    Uses native JS value setter + events — reliable, never blocks."""
     user_id = body.get("userId", "default")
-    ref = body.get("ref", "").lstrip("@e")  # Handle "@e2", "e2", "2"
+    ref = body.get("ref", "").lstrip("@e")
+    selector = body.get("selector", "")
     text = body.get("text", "")
 
     page = _get_page(user_id, tab_id)
+
+    # Build search: prefer selector, then ref-as-id
+    if selector:
+        search = selector
+    elif ref and not ref.startswith(("#", ".")):
+        search = f"#{ref}"
+    else:
+        search = ref or ""
+
     try:
-        # Use Playwright's native fill — properly triggers React state
-        locator = page.locator(f"[data-hermes-ref='{ref}']")
-        if not locator.count():
-            return {"error": "element not found", "url": page.url}
-        locator.fill(text)
-        return {"ok": True, "url": page.url}
+        result = page.evaluate("""
+            (args) => {
+                const search = args[0];
+                const text = args[1];
+                const el = document.querySelector(search);
+                if (!el) return JSON.stringify({ok: false, error: 'not found: ' + search});
+                const ns = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                ns.call(el, text);
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                return JSON.stringify({ok: true, value: el.value.length > 0 ? '***' : 'empty', search: search});
+            }
+        """, [search, text])
+        data = json.loads(result)
+        return {"ok": data.get("ok", False), "url": page.url, "method": "js", **{k: v for k, v in data.items() if k != "ok"}}
     except Exception as e:
         return {"error": str(e)[:200], "url": page.url}
 
